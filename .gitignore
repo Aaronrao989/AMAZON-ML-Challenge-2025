@@ -1,0 +1,30 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.env
+.venv
+env/
+venv/
+
+# Jupyter and IDE settings
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# macOS and system files
+.DS_Store
+__MACOSX/
+
+# Logs and temp files
+logs/
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Submissions and large outputs
+cleaned_data.csv
