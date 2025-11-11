@@ -6,7 +6,7 @@ scipy>=1.12.0
 joblib>=1.3.0
 
 # Gradient boosting
-catboost>=1.3.2
+catboost>=1.2.8,<1.3.0
 
 # Text features
 sentence-transformers>=2.2.2
@@ -22,6 +22,6 @@ Pillow>=10.1.0
 tqdm>=4.66.0
 requests>=2.32.0
 
-# Optional for image embeddings (if using TensorFlow on M1)
-tensorflow-macos>=2.15.0
-tensorflow-metal>=0.9.0
+# Optional for image embeddings on mac M1
+# tensorflow-macos>=2.15.0
+# tensorflow-metal>=0.9.0
