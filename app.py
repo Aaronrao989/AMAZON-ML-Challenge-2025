@@ -33,21 +33,21 @@ st.set_page_config(layout="wide", page_title="Smart Pricing — Project Explorer
 # ---------------------------
 st.sidebar.title("Config / Artifacts")
 DATA_PATH = st.sidebar.text_input("Cleaned data CSV",
-    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/cleaned_data.csv")
+    value="/artifacts/cleaned_data.csv")
 TEST_CSV = st.sidebar.text_input("Test CSV (raw)",
-    value="/Users/aaronrao/Desktop/screenshots/student_resource/dataset/test.csv")
+    value="/dataset/test.csv")
 TFIDF_PATH = st.sidebar.text_input("TF-IDF vectorizer",
-    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/tfidf_vectorizer.pkl")
+    value="/artifacts/tfidf_vectorizer.pkl")
 MODEL_PATH = st.sidebar.text_input("CatBoost model",
-    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/catboost_model.pkl")
+    value="/artifacts/catboost_model.pkl")
 IMG_NPY = st.sidebar.text_input("Image embeddings (.npy)",
-    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/image_embeddings.npy")
+    value="/artifacts/image_embeddings.npy")
 IMG_CSV = st.sidebar.text_input("Image embeddings (.csv)",
-    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/image_embeddings.csv")
+    value="/artifacts/image_embeddings.csv")
 IMAGES_DIR = st.sidebar.text_input("Local images folder",
-    value="/Users/aaronrao/Desktop/screenshots/student_resource/images")
+    value="/images")
 SUBMISSION_OUT = st.sidebar.text_input("Submission output",
-    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/submission.csv")
+    value="/artifacts/submission.csv")
 MAX_IMAGE_PREVIEW = st.sidebar.slider("Max images to preview", 1, 16, 6)
 
 st.sidebar.markdown("---")
