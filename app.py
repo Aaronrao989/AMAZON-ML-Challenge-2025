@@ -1,11 +1,11 @@
 """
 Streamlit dashboard for the Smart Product Pricing project (robust for Streamlit Cloud).
-Includes a safe "Generate model" handler with full traceback display and fallback training.
-
-Usage:
-- Place artifacts in artifacts/ or set ARTIFACT_URLS in Streamlit Secrets
-- Deploy on Streamlit Cloud or run locally:
-    streamlit run app.py
+Includes:
+- Auto-download from st.secrets["ARTIFACT_URLS"]
+- Sidebar uploaders for artifacts
+- Robust Generate model with CatBoost (fallback to RandomForest)
+- Chunked prediction to avoid OOM on Streamlit Cloud
+- use_container_width for images (replaces deprecated use_column_width)
 """
 
 import os
@@ -13,6 +13,7 @@ import io
 import traceback
 from pathlib import Path
 import time
+import json
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,42 @@ from scipy.sparse import csr_matrix, hstack as sparse_hstack
 
 # Page config
 st.set_page_config(layout="wide", page_title="Smart Pricing — Project Explorer")
+
+# ---------------------------
+# Utility: chunked prediction to avoid OOM on large dense arrays
+# ---------------------------
+def chunked_predict(model, X, chunk_size=512):
+    """
+    Predict in chunks to avoid allocating a giant dense array.
+    - model: fitted model (CatBoost or sklearn-like)
+    - X: scipy.sparse matrix or numpy array
+    Returns concatenated predictions (1D numpy array).
+    """
+    model_name = getattr(model, "__class__", None).__name__ if model is not None else ""
+    is_catboost = model_name.startswith("CatBoost")
+
+    n_rows = X.shape[0]
+    preds_chunks = []
+    for start in range(0, n_rows, chunk_size):
+        end = min(n_rows, start + chunk_size)
+        # slice sparse or dense matrix
+        if hasattr(X, "tocsr"):
+            X_chunk = X[start:end]
+        else:
+            X_chunk = X[start:end]
+        if is_catboost:
+            try:
+                Xc = X_chunk.toarray() if hasattr(X_chunk, "toarray") else X_chunk
+                preds = model.predict(Xc)
+            except Exception:
+                preds = model.predict(X_chunk)
+        else:
+            preds = model.predict(X_chunk)
+        preds_chunks.append(np.asarray(preds).reshape(-1))
+    if preds_chunks:
+        return np.concatenate(preds_chunks, axis=0)
+    else:
+        return np.array([])
 
 # ---------------------------
 # Helper: download missing artifacts (Streamlit-secrets driven)
@@ -97,10 +134,11 @@ uploaded_test_csv = st.sidebar.file_uploader("Upload test.csv (optional)", type=
 
 st.sidebar.markdown("---")
 st.sidebar.header("Model generation options")
+# safer defaults for Streamlit Cloud
 train_on_subset = st.sidebar.checkbox("Train on subset (safe for Cloud)", value=True)
-subset_size = st.sidebar.number_input("Subset size (rows)", min_value=100, max_value=100000, value=2000, step=100)
+subset_size = st.sidebar.number_input("Subset size (rows)", min_value=100, max_value=100000, value=1000, step=100)
 random_state = st.sidebar.number_input("Random seed", value=42, step=1)
-catboost_params = st.sidebar.text_area("CatBoost params (JSON)", value='{"iterations":100, "verbose":0}', height=80)
+catboost_params = st.sidebar.text_area("CatBoost params (JSON)", value='{"iterations":50, "verbose":0}', height=80)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("If artifacts are missing, set direct URLs in Streamlit Secrets as `ARTIFACT_URLS` (see README).")
@@ -231,7 +269,7 @@ def show_image_grid(image_paths, cols=3, size=(180, 180)):
         col = cols_w[i % cols]
         try:
             img = Image.open(path)
-            col.image(img, caption=Path(path).name, use_column_width=True)
+            col.image(img, caption=Path(path).name, use_container_width=True)
         except Exception as e:
             col.write(f"Error loading image: {e}")
 
@@ -473,15 +511,14 @@ if generate_clicked:
             used_catboost = False
             try:
                 from catboost import CatBoostRegressor
-                import json
                 params = {}
                 try:
                     params = json.loads(catboost_params)
                 except Exception:
                     st.warning("CatBoost params JSON invalid, using defaults")
-                    params = {"iterations": 100, "verbose": 0}
+                    params = {"iterations": 50, "verbose": 0}
                 st.info("Training CatBoostRegressor (native). This may take time...")
-                # CatBoost can accept numpy arrays; convert if sparse
+                # CatBoost expects dense arrays; convert in chunks during predict, but fit on dense arrays (small subset)
                 X_tr_dense = X_tr.toarray() if hasattr(X_tr, "toarray") else X_tr
                 X_val_dense = X_val.toarray() if hasattr(X_val, "toarray") else X_val
                 m = CatBoostRegressor(**params)
@@ -495,22 +532,20 @@ if generate_clicked:
                 rf.fit(X_tr, y_tr)
                 model_obj = rf
 
-            # Evaluate quickly
+            # Evaluate quickly using chunked_predict to avoid OOM
             try:
-                preds_val = model_obj.predict(X_val.toarray() if used_catboost and hasattr(X_val, "toarray") else X_val)
+                preds_val = chunked_predict(model_obj, X_val, chunk_size=512)
                 rmse = mean_squared_error(y_val, preds_val, squared=False)
                 st.success(f"Validation RMSE: {rmse:.4f}")
             except Exception:
-                st.warning("Could not compute validation metric (shape mismatch?)")
+                st.warning("Could not compute validation metric (shape mismatch or prediction error)")
 
             # Save model to artifacts/
             os.makedirs("artifacts", exist_ok=True)
             timestamp = int(time.time())
-            # Save joblib pickle
             pkl_path = f"artifacts/model_{timestamp}.pkl"
             joblib.dump(model_obj, pkl_path, compress=3)
             st.success(f"Saved model pickle → {pkl_path}")
-            # If CatBoost used, also save native cbm
             if used_catboost:
                 try:
                     cbm_path = f"artifacts/catboost_model_{timestamp}.cbm"
@@ -519,9 +554,10 @@ if generate_clicked:
                 except Exception as e_savecb:
                     st.warning(f"Failed to save CatBoost native model: {e_savecb}")
 
-            # Update sidebar MODEL_PATH to last saved pickle so inference uses it
+            # Update sidebar MODEL_PATH to last saved pickle (note: this won't persist to secrets)
             st.info("Updating MODEL_PATH to use the freshly saved model for inference.")
-            st.sidebar.text_input("CatBoost model", value=pkl_path, key="MODEL_PATH_AFTER_SAVE")
+            # show a new text input so user can copy the path if needed
+            st.sidebar.text_input("Last saved model (use this for inference)", value=pkl_path, key="MODEL_PATH_AFTER_SAVE")
             st.success("Model generation finished successfully.")
 
     except Exception as e:
@@ -538,7 +574,7 @@ st.header("5) Load model & run inference")
 model_loaded = False
 model = None
 model_source_path = MODEL_PATH
-# If user uploaded model, it's already overridden earlier
+# If user uploaded model, MODEL_PATH variable was overridden above
 if os.path.exists(model_source_path):
     try:
         model = load_model(model_source_path)
@@ -606,15 +642,16 @@ if run_infer:
                     X_full = sparse_hstack([X_text_sp, X_num, X_img], format="csr") if use_image else sparse_hstack([X_text_sp, X_num], format="csr")
 
                     st.write("Feature matrix shape (sparse):", X_full.shape)
+
                     preds = None
                     try:
-                        preds = model.predict(X_full.toarray() if hasattr(X_full, "toarray") and hasattr(model, "predict") and getattr(model, "__class__", None).__name__.startswith("CatBoost") else X_full)
+                        preds = chunked_predict(model, X_full, chunk_size=512)
                     except Exception as e:
-                        st.error("Model prediction failed (shape/feature-order mismatch).")
+                        st.error("Model prediction failed (shape/feature-order mismatch or runtime error).")
                         st.error(str(e))
                         st.text(traceback.format_exc())
 
-                    if preds is not None:
+                    if preds is not None and len(preds) == X_full.shape[0]:
                         df_out = df_local.copy()
                         df_out["predicted_price"] = preds
                         out_path = SUBMISSION_OUT if SUBMISSION_OUT else "artifacts/predictions.csv"
@@ -625,6 +662,8 @@ if run_infer:
                             df_out[["predicted_price"]].to_csv(out_path, index=False)
                         st.success(f"Predictions saved → {out_path}")
                         st.dataframe(df_out[["sample_id", "predicted_price"]].head(20) if "sample_id" in df_out.columns else df_out[["predicted_price"]].head(20))
+                    else:
+                        st.error("Prediction result size mismatch or empty predictions (check model and features).")
 
             except Exception as e:
                 st.error(f"Unexpected error during inference: {e}")
@@ -683,18 +722,20 @@ if st.button("Create submission.csv from dataset/test.csv"):
                     X_full = sparse_hstack([X_text_sp, X_num, X_img], format="csr") if use_image else sparse_hstack([X_text_sp, X_num], format="csr")
                     preds = None
                     try:
-                        preds = model.predict(X_full.toarray() if hasattr(X_full, "toarray") and getattr(model, "__class__", None).__name__.startswith("CatBoost") else X_full)
+                        preds = chunked_predict(model, X_full, chunk_size=512)
                     except Exception as e:
                         st.error("Prediction failed (check shapes / feature order).")
                         st.error(str(e))
                         st.text(traceback.format_exc())
 
-                    if preds is not None:
+                    if preds is not None and len(preds) == X_full.shape[0]:
                         submission = pd.DataFrame({"sample_id": test_df["sample_id"], "price": preds})
                         os.makedirs(os.path.dirname(SUBMISSION_OUT) or ".", exist_ok=True)
                         submission.to_csv(SUBMISSION_OUT, index=False)
                         st.success(f"Submission saved → {SUBMISSION_OUT}")
                         st.dataframe(submission.head(10))
+                    else:
+                        st.error("Submission prediction failed or output size mismatch.")
 
             except Exception as e:
                 st.error(f"Unexpected error while preparing submission: {e}")
