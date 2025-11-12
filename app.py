@@ -1,14 +1,18 @@
-# app_streamlit_full.py
+# app.py
 """
-Smart Product Pricing — Project Explorer (all-in-one).
-Combines robust loading, training (CatBoost fallback), chunked prediction,
-and improved validation diagnostics with sklearn-version-safe RMSE computation.
+Streamlit dashboard for the Smart Product Pricing project.
+
+Usage:
+    .venv activated
+    pip install streamlit pandas numpy joblib pillow matplotlib altair scipy catboost
+    streamlit run app.py
+
+This app assumes your project artifacts live in 'artifacts/' and model/vectorizer are saved there.
+Paths are configurable via the sidebar.
 """
 
 import os
 import io
-import time
-import json
 import traceback
 from pathlib import Path
 
@@ -17,244 +21,44 @@ import pandas as pd
 import joblib
 from PIL import Image
 import streamlit as st
-import requests
+import matplotlib.pyplot as plt
 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
+# sparse helpers
 from scipy.sparse import csr_matrix, hstack as sparse_hstack
 
-# Page
 st.set_page_config(layout="wide", page_title="Smart Pricing — Project Explorer")
 
 # ---------------------------
-# Utility functions
-# ---------------------------
-
-def compute_rmse(y_true, y_pred):
-    """
-    Compute RMSE in a way that's compatible with sklearn versions
-    that do or do not support mean_squared_error(..., squared=False).
-    """
-    try:
-        # preferred if sklearn supports squared param
-        return mean_squared_error(y_true, y_pred, squared=False)
-    except TypeError:
-        # fallback: compute MSE then sqrt
-        mse = mean_squared_error(y_true, y_pred)
-        return float(np.sqrt(mse))
-
-def chunked_predict(model, X, chunk_size=512):
-    """
-    Predict in chunks to avoid OOM on large sparse matrices.
-    Returns a 1D numpy array of predictions (if possible).
-    """
-    if model is None:
-        raise RuntimeError("Model is None in chunked_predict")
-
-    model_cls = getattr(model, "__class__", None)
-    model_name = model_cls.__name__ if model_cls is not None else ""
-    is_catboost = model_name.startswith("CatBoost")
-
-    n_rows = X.shape[0]
-    preds_chunks = []
-    for start in range(0, n_rows, chunk_size):
-        end = min(n_rows, start + chunk_size)
-        # slice
-        X_chunk = X[start:end]
-        try:
-            if is_catboost:
-                # CatBoost often needs dense arrays for predict
-                Xc = X_chunk.toarray() if hasattr(X_chunk, "toarray") else X_chunk
-                preds = model.predict(Xc)
-            else:
-                preds = model.predict(X_chunk)
-        except Exception as e:
-            # Try alternative: if chunk is sparse and model supports sparse, feed as-is
-            try:
-                preds = model.predict(X_chunk)
-            except Exception:
-                raise
-        preds_chunks.append(np.asarray(preds).reshape(-1 if np.asarray(preds).ndim == 1 else (preds.shape[0], -1)))
-    if not preds_chunks:
-        return np.array([])
-    # Concatenate carefully: handle 1D or 2D (multi-output)
-    first = preds_chunks[0]
-    if first.ndim == 1:
-        return np.concatenate([p.reshape(-1) for p in preds_chunks], axis=0)
-    else:
-        # 2D: stack vertically
-        return np.vstack(preds_chunks)
-
-def download_if_missing(url, dest_path, chunk_size=1 << 20, timeout=60):
-    dest = Path(dest_path)
-    if dest.exists():
-        return True
-    if not url:
-        return False
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with st.spinner(f"Downloading {dest.name} ..."):
-            resp = requests.get(url, stream=True, timeout=timeout)
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0) or 0)
-            downloaded = 0
-            tmp_path = str(dest_path) + ".part"
-            with open(tmp_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            st.progress(min(1.0, downloaded / total))
-            os.replace(tmp_path, dest_path)
-        return dest.exists()
-    except Exception as e:
-        st.error(f"Failed to download {dest.name}: {e}")
-        return False
-
-def basic_text_stats(s: pd.Series):
-    s = s.fillna("").astype(str)
-    n_words = s.str.split().apply(lambda ws: len(ws) if isinstance(ws, list) else 0)
-    n_unique = s.str.split().apply(lambda ws: len(set(ws)) if isinstance(ws, list) else 0)
-    avg_word_len = s.apply(lambda x: np.mean([len(w) for w in x.split()]) if len(x.split())>0 else 0)
-    return pd.DataFrame({
-        "n_chars": s.str.len(),
-        "n_words": n_words,
-        "n_unique_words": n_unique,
-        "avg_word_len": avg_word_len
-    })
-
-def safe_text_series(df, col_name):
-    if col_name in df.columns:
-        return df[col_name].fillna("").astype(str)
-    else:
-        return pd.Series([""] * len(df), index=df.index)
-
-def show_image_grid(image_paths, cols=3):
-    cols_w = st.columns(cols)
-    for i, path in enumerate(image_paths):
-        col = cols_w[i % cols]
-        try:
-            img = Image.open(path)
-            col.image(img, caption=Path(path).name, use_container_width=True)
-        except Exception as e:
-            col.write(f"Error loading image: {e}")
-
-def safe_tfidf_info(tf):
-    info = {}
-    try:
-        info["vocab_size"] = len(tf.get_feature_names_out())
-    except Exception:
-        try:
-            info["vocab_size"] = len(tf.get_feature_names())
-        except Exception:
-            info["vocab_size"] = None
-    try:
-        info["idf"] = pd.Series(tf.idf_, index=tf.get_feature_names_out()).sort_values()
-    except Exception:
-        info["idf"] = None
-    return info
-
-# ---------------------------
-# Sidebar config & uploads
+# Sidebar: paths + quick config
 # ---------------------------
 st.sidebar.title("Config / Artifacts")
-DEFAULTS = {
-    "DATA_PATH": "artifacts/cleaned_data.csv",
-    "TEST_CSV": "dataset/test.csv",
-    "TFIDF_PATH": "artifacts/tfidf_vectorizer.pkl",
-    "MODEL_PATH": "artifacts/catboost_model.pkl",
-    "IMG_NPY": "artifacts/image_embeddings.npy",
-    "IMG_CSV": "artifacts/image_embeddings.csv",
-    "IMAGES_DIR": "images",
-    "SUBMISSION_OUT": "artifacts/submission.csv"
-}
-DATA_PATH = st.sidebar.text_input("Cleaned data CSV", value=DEFAULTS["DATA_PATH"])
-TEST_CSV = st.sidebar.text_input("Test CSV (raw)", value=DEFAULTS["TEST_CSV"])
-TFIDF_PATH = st.sidebar.text_input("TF-IDF vectorizer", value=DEFAULTS["TFIDF_PATH"])
-MODEL_PATH = st.sidebar.text_input("Model path", value=DEFAULTS["MODEL_PATH"])
-IMG_NPY = st.sidebar.text_input("Image embeddings (.npy)", value=DEFAULTS["IMG_NPY"])
-IMG_CSV = st.sidebar.text_input("Image embeddings (.csv)", value=DEFAULTS["IMG_CSV"])
-IMAGES_DIR = st.sidebar.text_input("Local images folder", value=DEFAULTS["IMAGES_DIR"])
-SUBMISSION_OUT = st.sidebar.text_input("Submission output", value=DEFAULTS["SUBMISSION_OUT"])
+DATA_PATH = st.sidebar.text_input("Cleaned data CSV",
+    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/cleaned_data.csv")
+TEST_CSV = st.sidebar.text_input("Test CSV (raw)",
+    value="/Users/aaronrao/Desktop/screenshots/student_resource/dataset/test.csv")
+TFIDF_PATH = st.sidebar.text_input("TF-IDF vectorizer",
+    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/tfidf_vectorizer.pkl")
+MODEL_PATH = st.sidebar.text_input("CatBoost model",
+    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/catboost_model.pkl")
+IMG_NPY = st.sidebar.text_input("Image embeddings (.npy)",
+    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/image_embeddings.npy")
+IMG_CSV = st.sidebar.text_input("Image embeddings (.csv)",
+    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/image_embeddings.csv")
+IMAGES_DIR = st.sidebar.text_input("Local images folder",
+    value="/Users/aaronrao/Desktop/screenshots/student_resource/images")
+SUBMISSION_OUT = st.sidebar.text_input("Submission output",
+    value="/Users/aaronrao/Desktop/screenshots/student_resource/artifacts/submission.csv")
 MAX_IMAGE_PREVIEW = st.sidebar.slider("Max images to preview", 1, 16, 6)
 
-uploaded_model = st.sidebar.file_uploader("Upload model (.pkl / .cbm / .bin / .model)", type=["pkl", "cbm", "bin", "model"])
-uploaded_tfidf = st.sidebar.file_uploader("Upload TF-IDF vectorizer (.pkl)", type=["pkl"])
-uploaded_npy = st.sidebar.file_uploader("Upload image embeddings (.npy)", type=["npy"])
-uploaded_img_csv = st.sidebar.file_uploader("Upload image embeddings CSV (optional)", type=["csv"])
-uploaded_test_csv = st.sidebar.file_uploader("Upload test.csv (optional)", type=["csv"])
-
 st.sidebar.markdown("---")
-st.sidebar.header("Model generation options")
-train_on_subset = st.sidebar.checkbox("Train on subset (safe for Cloud)", value=True)
-subset_size = st.sidebar.number_input("Subset size (rows)", min_value=100, max_value=100000, value=1000, step=100)
-random_state = st.sidebar.number_input("Random seed", value=42, step=1)
-catboost_params = st.sidebar.text_area("CatBoost params (JSON)", value='{"iterations":50, "verbose":0}', height=80)
+st.sidebar.markdown("Built for: Smart Product Pricing (TF-IDF + Image embeddings + CatBoost)")
 
-# Auto-download URLs from secrets (optional)
-urls = {}
-try:
-    urls = st.secrets.get("ARTIFACT_URLS", {}) if hasattr(st, "secrets") else {}
-except Exception:
-    urls = {}
-
-TFIDF_LOCAL = Path(TFIDF_PATH)
-MODEL_LOCAL = Path(MODEL_PATH)
-IMG_NPY_LOCAL = Path(IMG_NPY)
-IMG_CSV_LOCAL = Path(IMG_CSV)
-TEST_CSV_LOCAL = Path(TEST_CSV)
-
-if not TFIDF_LOCAL.exists():
-    download_if_missing(urls.get("tfidf"), TFIDF_LOCAL)
-if not MODEL_LOCAL.exists():
-    download_if_missing(urls.get("model"), MODEL_LOCAL)
-if not IMG_NPY_LOCAL.exists():
-    download_if_missing(urls.get("img_npy"), IMG_NPY_LOCAL)
-if not IMG_CSV_LOCAL.exists():
-    download_if_missing(urls.get("img_csv"), IMG_CSV_LOCAL)
-if not TEST_CSV_LOCAL.exists():
-    download_if_missing(urls.get("test_csv"), TEST_CSV_LOCAL)
-
-# persist uploaded artifacts for the session
-if uploaded_model is not None:
-    tmp_model_path = Path("tmp_uploaded_model" + Path(uploaded_model.name).suffix)
-    with open(tmp_model_path, "wb") as f:
-        f.write(uploaded_model.read())
-    MODEL_PATH = str(tmp_model_path)
-    MODEL_LOCAL = tmp_model_path
-
-if uploaded_tfidf is not None:
-    tmp_tfidf = Path("tmp_uploaded_tfidf.pkl")
-    with open(tmp_tfidf, "wb") as f:
-        f.write(uploaded_tfidf.read())
-    TFIDF_PATH = str(tmp_tfidf)
-    TFIDF_LOCAL = tmp_tfidf
-
-if uploaded_npy is not None:
-    tmp_npy = Path("tmp_uploaded_image_embeddings.npy")
-    with open(tmp_npy, "wb") as f:
-        f.write(uploaded_npy.read())
-    IMG_NPY = str(tmp_npy)
-    IMG_NPY_LOCAL = tmp_npy
-
-if uploaded_img_csv is not None:
-    tmp_img_csv = Path("tmp_uploaded_image_embeddings.csv")
-    with open(tmp_img_csv, "wb") as f:
-        f.write(uploaded_img_csv.read())
-    IMG_CSV = str(tmp_img_csv)
-    IMG_CSV_LOCAL = tmp_img_csv
-
-if uploaded_test_csv is not None:
-    tmp_test_csv = Path("tmp_uploaded_test.csv")
-    with open(tmp_test_csv, "wb") as f:
-        f.write(uploaded_test_csv.read())
-    TEST_CSV = str(tmp_test_csv)
-    TEST_CSV_LOCAL = tmp_test_csv
+# Sidebar uploader fallback
+st.sidebar.markdown("### Optional: Upload model file")
+uploaded_model = st.sidebar.file_uploader("Upload model (.pkl / .cbm / .bin / .model)", type=["pkl", "cbm", "bin", "model"])
 
 # ---------------------------
-# Caching loaders
+# Helpers (cached)
 # ---------------------------
 @st.cache_data(show_spinner=False)
 def load_csv(path):
@@ -272,50 +76,98 @@ def load_npy(path):
 def load_model(path):
     """
     Robust model loader:
-    - tries joblib
-    - then tries CatBoostRegressor/Classifier (native load_model)
-    - Raises informative RuntimeError with last error text when all fail
+    - try joblib.load (pickles)
+    - if that fails and catboost is available, try CatBoostRegressor().load_model()
+    Raises on failure.
     """
-    last_err = None
-    # quick path existence
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Model file not found at path: {path}")
-
-    # joblib
+    # try joblib first (covers sklearn-like pickles)
     try:
         return joblib.load(path)
     except Exception as e_joblib:
         last_err = e_joblib
 
-    # try CatBoost
+    # try CatBoost native loader (lazy import)
     try:
         from catboost import CatBoostRegressor, CatBoostClassifier
-        try:
+        ext = Path(path).suffix.lower()
+        # If extension looks like a catboost native model, load it
+        if ext in {".cbm", ".bin", ".model"}:
             m = CatBoostRegressor()
             m.load_model(path)
             return m
-        except Exception:
+        else:
+            # Try generic CatBoost load
             try:
-                m2 = CatBoostClassifier()
-                m2.load_model(path)
-                return m2
-            except Exception as e_cb2:
-                last_err = e_cb2
+                m = CatBoostRegressor()
+                m.load_model(path)
+                return m
+            except Exception as e_cb:
+                last_err = e_cb
     except Exception as e_imp:
         last_err = e_imp
 
     raise RuntimeError(f"Failed to load model with joblib or CatBoost. Last error:\n{last_err}")
 
+def basic_text_stats(s: pd.Series):
+    """Return a dataframe of basic text stats for the series."""
+    s = s.fillna("").astype(str)
+    # n_words computation: split on whitespace
+    n_words = s.str.split().apply(lambda ws: len(ws) if isinstance(ws, list) else 0)
+    n_unique = s.str.split().apply(lambda ws: len(set(ws)) if isinstance(ws, list) else 0)
+    return pd.DataFrame({
+        "n_chars": s.str.len(),
+        "n_words": n_words,
+        "n_unique_words": n_unique
+    })
+
+def safe_text_series(df, col_name):
+    """
+    Return a Series of strings for column `col_name` in df.
+    If the column exists, returns df[col_name].fillna("").astype(str)
+    If it doesn't exist, returns an empty-string Series aligned with df.
+    """
+    if col_name in df.columns:
+        return df[col_name].fillna("").astype(str)
+    else:
+        # create Series with same index so concatenation preserves alignment
+        return pd.Series([""] * len(df), index=df.index)
+
+def show_image_grid(image_paths, cols=3, size=(180, 180)):
+    cols_w = st.columns(cols)
+    for i, path in enumerate(image_paths):
+        col = cols_w[i % cols]
+        try:
+            img = Image.open(path)
+            col.image(img, caption=Path(path).name, use_column_width=True)
+        except Exception as e:
+            col.write(f"Error loading image: {e}")
+
+# small utility to try to get TF-IDF attributes safely
+def safe_tfidf_info(tf):
+    info = {}
+    try:
+        info["vocab_size"] = len(tf.get_feature_names_out())
+    except Exception:
+        try:
+            info["vocab_size"] = len(tf.get_feature_names())
+        except Exception:
+            info["vocab_size"] = None
+    try:
+        info["idf"] = pd.Series(tf.idf_, index=tf.get_feature_names_out()).sort_values()
+    except Exception:
+        info["idf"] = None
+    return info
+
 # ---------------------------
-# Main UI Layout
+# Main layout
 # ---------------------------
 st.title("Smart Product Pricing — Project Explorer")
-st.markdown("Inspect dataset, generate models (CatBoost or RandomForest fallback), and run inference. Safe defaults for Streamlit Cloud.")
+st.markdown("Visualize dataset, features, images and run inference using your saved model.")
 
-# 1) Data load & preview
+# 1) Dataset preview / upload
 st.header("1) Data")
 col1, col2 = st.columns([2, 1])
+
 with col1:
     st.subheader("Load cleaned dataset")
     uploaded = st.file_uploader("Upload cleaned_data.csv (optional)", type=["csv"])
@@ -345,19 +197,18 @@ with col1:
 with col2:
     st.subheader("Quick text stats")
     if df is not None:
+        # pick a sensible text column
         text_col = "combined_text" if "combined_text" in df.columns else ("catalog_content" if "catalog_content" in df.columns else (df.columns[0] if len(df.columns) > 0 else None))
         st.write("Using text column:", text_col)
         if text_col is not None:
             stats = basic_text_stats(df[text_col])
             st.write(stats.describe().T)
-            try:
-                st.bar_chart(stats["n_words"].clip(0, 100).value_counts().sort_index().head(50))
-            except Exception:
-                pass
+            # show histogram-ish using bar_chart of word counts (clipped)
+            st.bar_chart(stats["n_words"].clip(0, 100).value_counts().sort_index().head(50))
         else:
             st.write("No columns available to compute text stats.")
 
-# 2) TF-IDF
+# 2) TF-IDF details
 st.header("2) Text features (TF-IDF)")
 tf_loaded = False
 tf = None
@@ -385,7 +236,7 @@ if tf_loaded:
     else:
         st.write("Could not extract idf (older sklearn or custom vectorizer).")
 
-# 3) Image embeddings
+# 3) Image embeddings preview
 st.header("3) Image features")
 img_emb_loaded = False
 img_emb = None
@@ -417,8 +268,10 @@ if img_emb_loaded:
         st.dataframe(pd.DataFrame(img_emb[:10, :10], columns=[f"dim_{i}" for i in range(min(10, img_emb.shape[1]))]))
     except Exception:
         st.write("Could not preview embeddings (unexpected shape).")
+
     st.subheader("Preview images (from local folder)")
     if os.path.exists(IMAGES_DIR):
+        # pick images corresponding to sample ids if available in img_df
         if img_df is not None and "sample_id" in img_df.columns:
             preview_ids = img_df["sample_id"].head(MAX_IMAGE_PREVIEW).astype(str).tolist()
             picked = []
@@ -427,12 +280,14 @@ if img_emb_loaded:
                 if os.path.exists(fname):
                     picked.append(fname)
             if not picked:
+                # fallback: list first images found
                 picked = [str(x) for x in list(Path(IMAGES_DIR).glob("*"))[:MAX_IMAGE_PREVIEW]]
             if picked:
                 show_image_grid(picked, cols=3)
             else:
                 st.write("No matching images found in images dir.")
         else:
+            # just show first N images from folder
             files = sorted(Path(IMAGES_DIR).glob("*"))[:MAX_IMAGE_PREVIEW]
             if files:
                 show_image_grid([str(x) for x in files], cols=3)
@@ -442,200 +297,22 @@ if img_emb_loaded:
         st.write("Images dir not found:", IMAGES_DIR)
 
 # ---------------------------
-# 4) Generate Model (robust)
+# 4) Model & Inference
 # ---------------------------
-st.header("4) Generate model (train & save)")
-st.markdown("Train a new model from the cleaned dataset. Use `Train on subset` for quick tests on Streamlit Cloud.")
-generate_clicked = st.button("Generate model")
-
-if generate_clicked:
-    try:
-        if df is None:
-            st.error("No cleaned dataset loaded. Upload or set DATA_PATH to proceed.")
-        else:
-            df_train = df.copy().fillna("")
-            if "combined_text" not in df_train.columns:
-                cat_series = safe_text_series(df_train, "catalog_content")
-                text_series = safe_text_series(df_train, "text")
-                df_train["combined_text"] = (cat_series + " " + text_series).str.lower()
-
-            if train_on_subset:
-                n = min(int(subset_size), len(df_train))
-                st.info(f"Training on subset: {n} rows (random_state={random_state})")
-                df_train = df_train.sample(n=n, random_state=int(random_state)).reset_index(drop=True)
-            else:
-                st.info(f"Training on full dataset: {len(df_train)} rows")
-
-            if not tf_loaded:
-                st.error("TF-IDF vectorizer not loaded. Upload or configure TFIDF_PATH.")
-                raise RuntimeError("TF-IDF missing")
-
-            # Transform text
-            X_text_sp = tf.transform(df_train["combined_text"].astype(str))
-
-            # numeric
-            num_cols = ["ipq", "word_count", "char_count", "avg_word_len", "num_unique_words"]
-            if "word_count" not in df_train.columns:
-                st.info("Computing text stats for numeric columns...")
-                stats = basic_text_stats(df_train["combined_text"])
-                for c in stats.columns:
-                    df_train[c] = stats[c]
-
-            for c in num_cols:
-                if c not in df_train.columns:
-                    df_train[c] = 0
-            X_num = csr_matrix(df_train[num_cols].astype(float).values)
-
-            # images optional
-            use_image = False
-            X_img = None
-            if img_emb_loaded and img_df is not None and "sample_id" in img_df.columns:
-                try:
-                    emb_dim = img_emb.shape[1] if img_emb.ndim == 2 else None
-                except Exception:
-                    emb_dim = None
-                if emb_dim:
-                    emb_map = dict(zip(img_df["sample_id"].astype(str), range(len(img_df))))
-                    emb_rows = []
-                    for sid in df_train["sample_id"].astype(str):
-                        idx = emb_map.get(sid, None)
-                        if idx is None:
-                            emb_rows.append(np.zeros(emb_dim, dtype=float))
-                        else:
-                            if idx < len(img_emb):
-                                emb_rows.append(img_emb[idx])
-                            else:
-                                emb_rows.append(np.zeros(emb_dim, dtype=float))
-                    X_img = csr_matrix(np.vstack(emb_rows))
-                    use_image = True
-
-            X_full = sparse_hstack([X_text_sp, X_num, X_img], format="csr") if use_image else sparse_hstack([X_text_sp, X_num], format="csr")
-            st.write("Feature matrix shape:", X_full.shape)
-
-            # target
-            target_col = "price" if "price" in df_train.columns else ("target" if "target" in df_train.columns else None)
-            if target_col is None:
-                st.error("Target column not found (expected 'price' or 'target'). Add it to your cleaned dataset.")
-                raise RuntimeError("Target missing")
-            y = df_train[target_col].astype(float).values
-
-            # split
-            X_tr, X_val, y_tr, y_val = train_test_split(X_full, y, test_size=0.1, random_state=int(random_state))
-
-            # train CatBoost if available else RandomForest
-            model_obj = None
-            used_catboost = False
-            try:
-                from catboost import CatBoostRegressor
-                params = {}
-                try:
-                    params = json.loads(catboost_params)
-                except Exception:
-                    st.warning("CatBoost params JSON invalid; using defaults")
-                    params = {"iterations": 50, "verbose": 0}
-                st.info("Training CatBoostRegressor (native). This may take time...")
-                X_tr_dense = X_tr.toarray() if hasattr(X_tr, "toarray") else X_tr
-                X_val_dense = X_val.toarray() if hasattr(X_val, "toarray") else X_val
-                m = CatBoostRegressor(**params)
-                # pass eval_set for early info; verbose controlled by params
-                m.fit(X_tr_dense, y_tr, eval_set=(X_val_dense, y_val), verbose=params.get("verbose", 0))
-                model_obj = m
-                used_catboost = True
-            except Exception as cb_exc:
-                st.warning(f"CatBoost unavailable or failed: {cb_exc}. Falling back to RandomForestRegressor.")
-                rf = RandomForestRegressor(n_estimators=100, random_state=int(random_state), n_jobs=2)
-                rf.fit(X_tr, y_tr)
-                model_obj = rf
-
-            # Improved evaluation block with diagnostics
-            try:
-                preds_val = chunked_predict(model_obj, X_val, chunk_size=512)
-                if preds_val is None:
-                    raise RuntimeError("chunked_predict returned None")
-                preds_val = np.asarray(preds_val)
-
-                # If preds_val is 2D with single column, squeeze
-                if preds_val.ndim == 2 and preds_val.shape[1] == 1:
-                    preds_val = preds_val.reshape(-1)
-                if preds_val.ndim == 2 and preds_val.shape[1] > 1:
-                    raise RuntimeError(
-                        f"Model returned multi-dimensional predictions shape={preds_val.shape}. "
-                        "This looks like a classifier (probabilities) or multi-output model. "
-                        "For RMSE we expect a 1D regression output."
-                    )
-                if preds_val.shape[0] != y_val.shape[0]:
-                    raise RuntimeError(f"Prediction length mismatch: preds={preds_val.shape[0]} vs y_val={y_val.shape[0]}")
-
-                # robust RMSE computation (works across sklearn versions)
-                rmse = compute_rmse(y_val, preds_val)
-                st.success(f"Validation RMSE: {rmse:.4f}")
-            except Exception as eval_exc:
-                st.warning("Could not compute validation metric (see diagnostics).")
-                with st.expander("Validation diagnostic info (click to expand)"):
-                    st.write("y_val shape:", getattr(y_val, "shape", None))
-                    try:
-                        st.write("y_val sample:", y_val[:10])
-                    except Exception:
-                        pass
-                    try:
-                        st.write("preds_val type:", type(preds_val) if 'preds_val' in locals() else None)
-                        st.write("preds_val shape (if available):", getattr(preds_val, "shape", None) if 'preds_val' in locals() else None)
-                        try:
-                            st.write("preds_val sample:", np.asarray(preds_val).reshape(-1)[:10] if 'preds_val' in locals() else None)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                    st.error(f"Validation evaluation error: {eval_exc}")
-                    st.text(traceback.format_exc())
-
-            # Save model
-            os.makedirs("artifacts", exist_ok=True)
-            timestamp = int(time.time())
-            pkl_path = f"artifacts/model_{timestamp}.pkl"
-            joblib.dump(model_obj, pkl_path, compress=3)
-            st.success(f"Saved model pickle → {pkl_path}")
-            if used_catboost:
-                try:
-                    cbm_path = f"artifacts/catboost_model_{timestamp}.cbm"
-                    model_obj.save_model(cbm_path)
-                    st.success(f"Saved CatBoost native model → {cbm_path}")
-                except Exception as e_savecb:
-                    st.warning(f"Failed to save CatBoost native model: {e_savecb}")
-
-            st.info("Updating sidebar MODEL_PATH to use the freshly saved model for inference.")
-            st.sidebar.text_input("Last saved model (use this for inference)", value=pkl_path, key="MODEL_PATH_AFTER_SAVE")
-            st.success("Model generation finished successfully.")
-
-    except Exception as e:
-        st.error(f"Model generation failed: {e}")
-        with st.expander("Show full traceback"):
-            st.text(traceback.format_exc())
-
-# ---------------------------
-# 5) Model & Inference (load and predict)
-# ---------------------------
-st.header("5) Load model & run inference")
+st.header("4) Model & Inference")
 model_loaded = False
 model = None
-model_source_path = MODEL_PATH
 
-# Inspect model path
-try:
-    p = Path(model_source_path)
-    st.write("Model path exists:", p.exists())
-    if p.exists():
-        st.write("Model file size (bytes):", p.stat().st_size)
-        st.write("Model file suffix:", p.suffix)
-        if p.suffix in [".txt", ".model", ".yaml"]:
-            try:
-                with open(p, "r", errors="ignore") as fh:
-                    lines = "".join(fh.readlines()[:30])
-                st.code(lines[:1000], language="text")
-            except Exception:
-                pass
-except Exception:
-    pass
+# Decide model path source: uploaded or configured path
+model_source_path = None
+if uploaded_model is not None:
+    # save upload to a temp file and use that path
+    tmp_model_path = os.path.join(".", "tmp_uploaded_model" + Path(uploaded_model.name).suffix)
+    with open(tmp_model_path, "wb") as f:
+        f.write(uploaded_model.read())
+    model_source_path = tmp_model_path
+else:
+    model_source_path = MODEL_PATH
 
 if os.path.exists(model_source_path):
     try:
@@ -646,10 +323,11 @@ if os.path.exists(model_source_path):
         st.error("Could not load model. See details below.")
         st.text(str(e))
         st.text(traceback.format_exc())
-        st.info("If this is a CatBoost model, ensure 'catboost' is in your requirements or upload a joblib-pickled model.")
+        st.info("If this is a CatBoost model, ensure 'catboost' is installed: pip install catboost")
+        st.info("If you trained with joblib/pickle, ensure the environment has the same packages available (e.g., catboost).")
 else:
     st.info(f"Model not found at configured path: {model_source_path}")
-    st.info("You can update MODEL_PATH in the sidebar or upload a model file (pkl/cbm) using the sidebar uploader.")
+    st.info("You can either update the MODEL_PATH in the sidebar or upload a model file (pkl/cbm) using the sidebar uploader.")
 
 run_infer = st.button("Run inference on cleaned_data (predict & save)")
 if run_infer:
@@ -661,27 +339,34 @@ if run_infer:
         with st.spinner("Preprocessing and predicting..."):
             try:
                 df_local = df.copy().fillna("")
+                # make combined_text only if missing - use safe_text_series helper
                 if "combined_text" not in df_local.columns:
                     cat_series = safe_text_series(df_local, "catalog_content")
                     text_series = safe_text_series(df_local, "text")
                     df_local["combined_text"] = (cat_series + " " + text_series).str.lower()
 
+                # safe TF-IDF transform (keep sparse)
                 if not tf_loaded:
                     st.error("TF-IDF not loaded; cannot transform text.")
                 else:
-                    X_text_sp = tf.transform(df_local["combined_text"].astype(str))
+                    X_text_sp = tf.transform(df_local["combined_text"].astype(str))  # sparse matrix
+
+                    # numeric features: ensure present and convert to sparse
                     num_cols = ["ipq", "word_count", "char_count", "avg_word_len", "num_unique_words"]
                     if "word_count" not in df_local.columns:
+                        st.info("Computing text stats for numeric columns...")
                         stats = basic_text_stats(df_local["combined_text"])
                         for c in stats.columns:
                             df_local[c] = stats[c]
+
                     for c in num_cols:
                         if c not in df_local.columns:
                             df_local[c] = 0
+
                     X_num = csr_matrix(df_local[num_cols].astype(float).values)
 
+                    # image embeddings (align) -> convert to sparse
                     use_image = False
-                    X_img = None
                     if img_emb_loaded and img_df is not None and "sample_id" in img_df.columns:
                         try:
                             emb_dim = img_emb.shape[1] if img_emb.ndim == 2 else None
@@ -701,49 +386,49 @@ if run_infer:
                                         emb_rows.append(np.zeros(emb_dim, dtype=float))
                             X_img = csr_matrix(np.vstack(emb_rows))
                             use_image = True
+                        else:
+                            st.warning("Image embeddings could not determine embedding dim; skipping image features.")
+                            use_image = False
+                    else:
+                        use_image = False
 
-                    X_full = sparse_hstack([X_text_sp, X_num, X_img], format="csr") if use_image else sparse_hstack([X_text_sp, X_num], format="csr")
+                    # stack features - always use sparse stacking to avoid dense blowup
+                    if use_image:
+                        X_full = sparse_hstack([X_text_sp, X_num, X_img], format="csr")
+                    else:
+                        X_full = sparse_hstack([X_text_sp, X_num], format="csr")
+
                     st.write("Feature matrix shape (sparse):", X_full.shape)
 
+                    # predict (handle potential errors)
                     preds = None
                     try:
-                        preds = chunked_predict(model, X_full, chunk_size=512)
+                        preds = model.predict(X_full)
                     except Exception as e:
-                        st.error("Model prediction failed (shape/feature-order mismatch or runtime error).")
+                        st.error("Model prediction failed. This is often due to a shape/feature-order mismatch.")
                         st.error(str(e))
                         st.text(traceback.format_exc())
 
                     if preds is not None:
-                        preds = np.asarray(preds)
-                        # squeeze if possible
-                        if preds.ndim == 2 and preds.shape[1] == 1:
-                            preds = preds.reshape(-1)
-                        if preds.ndim == 2 and preds.shape[1] > 1:
-                            st.error(f"Model returned multi-dimensional predictions shape={preds.shape}. Cannot assign 'predicted_price' without reduction.")
-                        elif len(preds) == X_full.shape[0]:
-                            df_out = df_local.copy()
-                            df_out["predicted_price"] = preds
-                            out_path = SUBMISSION_OUT if SUBMISSION_OUT else "artifacts/predictions.csv"
-                            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-                            if "sample_id" in df_out.columns:
-                                df_out[["sample_id", "predicted_price"]].to_csv(out_path, index=False)
-                            else:
-                                df_out[["predicted_price"]].to_csv(out_path, index=False)
-                            st.success(f"Predictions saved → {out_path}")
-                            st.dataframe(df_out[["sample_id", "predicted_price"]].head(20) if "sample_id" in df_out.columns else df_out[["predicted_price"]].head(20))
+                        df_out = df_local.copy()
+                        df_out["predicted_price"] = preds
+                        out_path = SUBMISSION_OUT if SUBMISSION_OUT else "artifacts/predictions.csv"
+                        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                        if "sample_id" in df_out.columns:
+                            df_out[["sample_id", "predicted_price"]].to_csv(out_path, index=False)
                         else:
-                            st.error("Prediction result size mismatch or empty predictions (check model and features).")
-                    else:
-                        st.error("Empty predictions returned by the model.")
+                            df_out[["predicted_price"]].to_csv(out_path, index=False)
+                        st.success(f"Predictions saved → {out_path}")
+                        st.dataframe(df_out[["sample_id", "predicted_price"]].head(20) if "sample_id" in df_out.columns else df_out[["predicted_price"]].head(20))
 
             except Exception as e:
                 st.error(f"Unexpected error during inference: {e}")
                 st.text(traceback.format_exc())
 
 # ---------------------------
-# 6) Create submission from test.csv
+# 5) Generate official submission (test.csv)
 # ---------------------------
-st.header("6) Generate submission (test.csv)")
+st.header("5) Generate submission (test.csv)")
 if st.button("Create submission.csv from dataset/test.csv"):
     if not model_loaded:
         st.error("Model not loaded.")
@@ -753,6 +438,7 @@ if st.button("Create submission.csv from dataset/test.csv"):
         with st.spinner("Preprocessing test.csv and generating submission..."):
             try:
                 test_df = pd.read_csv(TEST_CSV).fillna("")
+                # build combined text if absent - use safe_text_series helper
                 if "combined_text" not in test_df.columns:
                     cat_series = safe_text_series(test_df, "catalog_content")
                     text_series = safe_text_series(test_df, "text")
@@ -762,6 +448,7 @@ if st.button("Create submission.csv from dataset/test.csv"):
                     st.error("TF-IDF not loaded.")
                 else:
                     X_text_sp = tf.transform(test_df["combined_text"].astype(str))
+
                     num_cols = ["ipq", "word_count", "char_count", "avg_word_len", "num_unique_words"]
                     if "word_count" not in test_df.columns:
                         stats = basic_text_stats(test_df["combined_text"])
@@ -772,8 +459,8 @@ if st.button("Create submission.csv from dataset/test.csv"):
                             test_df[c] = 0
                     X_num = csr_matrix(test_df[num_cols].astype(float).values)
 
+                    # attach image embeddings if available
                     use_image = False
-                    X_img = None
                     if img_emb_loaded and img_df is not None and "sample_id" in img_df.columns:
                         try:
                             emb_dim = img_emb.shape[1] if img_emb.ndim == 2 else None
@@ -792,44 +479,35 @@ if st.button("Create submission.csv from dataset/test.csv"):
                             use_image = True
 
                     X_full = sparse_hstack([X_text_sp, X_num, X_img], format="csr") if use_image else sparse_hstack([X_text_sp, X_num], format="csr")
+
                     preds = None
                     try:
-                        preds = chunked_predict(model, X_full, chunk_size=512)
+                        preds = model.predict(X_full)
                     except Exception as e:
                         st.error("Prediction failed (check shapes / feature order).")
                         st.error(str(e))
                         st.text(traceback.format_exc())
 
                     if preds is not None:
-                        preds = np.asarray(preds)
-                        if preds.ndim == 2 and preds.shape[1] == 1:
-                            preds = preds.reshape(-1)
-                        if preds.ndim == 2 and preds.shape[1] > 1:
-                            st.error(f"Model returned multi-dimensional predictions shape={preds.shape}. Cannot produce single 'price' column.")
-                        elif len(preds) == X_full.shape[0]:
-                            submission = pd.DataFrame({"sample_id": test_df["sample_id"], "price": preds})
-                            os.makedirs(os.path.dirname(SUBMISSION_OUT) or ".", exist_ok=True)
-                            submission.to_csv(SUBMISSION_OUT, index=False)
-                            st.success(f"Submission saved → {SUBMISSION_OUT}")
-                            st.dataframe(submission.head(10))
-                        else:
-                            st.error("Submission prediction failed or output size mismatch.")
-                    else:
-                        st.error("Empty predictions returned; submission not saved.")
+                        submission = pd.DataFrame({"sample_id": test_df["sample_id"], "price": preds})
+                        os.makedirs(os.path.dirname(SUBMISSION_OUT) or ".", exist_ok=True)
+                        submission.to_csv(SUBMISSION_OUT, index=False)
+                        st.success(f"Submission saved → {SUBMISSION_OUT}")
+                        st.dataframe(submission.head(10))
 
             except Exception as e:
                 st.error(f"Unexpected error while preparing submission: {e}")
                 st.text(traceback.format_exc())
 
 # ---------------------------
-# 7) Download / inspect artifacts
+# 6) Download artifacts
 # ---------------------------
-st.header("7) Download / Inspect artifacts")
+st.header("6) Download / Inspect artifacts")
 col_a, col_b, col_c = st.columns(3)
 with col_a:
-    if os.path.exists(MODEL_PATH):
+    if os.path.exists(model_source_path):
         try:
-            st.download_button("Download model file", data=open(MODEL_PATH, "rb"), file_name=os.path.basename(MODEL_PATH))
+            st.download_button("Download model file", data=open(model_source_path, "rb"), file_name=os.path.basename(model_source_path))
         except Exception:
             pass
 with col_b:
@@ -846,4 +524,4 @@ with col_c:
             pass
 
 st.markdown("---")
-st.write("Notes: The improved validation block provides full diagnostics on mismatch or multi-output predictions. If your model returns probabilities or multi-dimensional outputs, adapt evaluation or reduce predictions to a single value before computing RMSE.")
+st.write("Tips: If your TF-IDF vectorizer + model were trained with a different order of features than this app assumes, you'll need to adapt the stacking order used in the inference section to match your training code (TF-IDF first, numeric features second, image embeddings last).")
