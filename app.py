@@ -2,7 +2,7 @@
 """
 Smart Product Pricing — Project Explorer (all-in-one).
 Combines robust loading, training (CatBoost fallback), chunked prediction,
-and improved validation diagnostics to replace the vague "Could not compute validation metric".
+and improved validation diagnostics with sklearn-version-safe RMSE computation.
 """
 
 import os
@@ -30,6 +30,19 @@ st.set_page_config(layout="wide", page_title="Smart Pricing — Project Explorer
 # ---------------------------
 # Utility functions
 # ---------------------------
+
+def compute_rmse(y_true, y_pred):
+    """
+    Compute RMSE in a way that's compatible with sklearn versions
+    that do or do not support mean_squared_error(..., squared=False).
+    """
+    try:
+        # preferred if sklearn supports squared param
+        return mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError:
+        # fallback: compute MSE then sqrt
+        mse = mean_squared_error(y_true, y_pred)
+        return float(np.sqrt(mse))
 
 def chunked_predict(model, X, chunk_size=512):
     """
@@ -553,7 +566,8 @@ if generate_clicked:
                 if preds_val.shape[0] != y_val.shape[0]:
                     raise RuntimeError(f"Prediction length mismatch: preds={preds_val.shape[0]} vs y_val={y_val.shape[0]}")
 
-                rmse = mean_squared_error(y_val, preds_val, squared=False)
+                # robust RMSE computation (works across sklearn versions)
+                rmse = compute_rmse(y_val, preds_val)
                 st.success(f"Validation RMSE: {rmse:.4f}")
             except Exception as eval_exc:
                 st.warning("Could not compute validation metric (see diagnostics).")
